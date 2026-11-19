@@ -229,11 +229,12 @@ def fitted_forecast(case: dict, reads, first_idx: int):
         a_n, b_n, resid_n = fit_n
         n_star = max(1.0, math.exp(a_n + b_n * x_target))
 
-    # (b) Fit each trophy's earner count the same way.
+    # (b) Fit each trophy's earner count the same way: median log E
+    # per whole-hour bin first, so the flat stretches between refreshes
+    # (E only changes at a refresh) don't overweight the fit.
     out = []
     for i, _trophy in enumerate(case["trophies"]):
-        xs_i = []
-        ys_i = []
+        bins_i = {}
         for read in reads[first_idx:]:
             rate = read["rates"][i]
             if rate is None:
@@ -241,8 +242,10 @@ def fitted_forecast(case: dict, reads, first_idx: int):
             earners = rate / 100.0 * read["players_tracked"]
             if earners < 1.0:
                 continue
-            xs_i.append(log_time(hours_since_release(parse_time(read["at"]))))
-            ys_i.append(math.log(earners))
+            hour = int(hours_since_release(parse_time(read["at"])))
+            bins_i.setdefault(hour, []).append(math.log(earners))
+        xs_i = [log_time(hour) for hour in sorted(bins_i)]
+        ys_i = [median(bins_i[hour]) for hour in sorted(bins_i)]
         fit = least_squares(xs_i, ys_i)
         if fit is None:
             last_rate = reads[-1]["rates"][i]
