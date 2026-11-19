@@ -53,13 +53,24 @@ RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 # 3,868 - 638 = 3,230 new players and 4,276 - 943 = 3,333 new trophies:
 # about one trophy per new player (the opening activity every new
 # player does), with the remaining ~103 trophies spread over the
-# trophies the old players already held, in proportion to how many
-# held each one. A trophy every tracked player already held (100%)
-# stays held by everyone. This prior applies ONLY to a history that
-# has never refreshed; a history with a refresh is fitted instead.
+# early trophies only, in proportion to how many held each one: the
+# trophies the first wave had already reached, i.e. rate >= 1.0% in
+# this case's own last read. The launch-night rates cluster at 0.63 /
+# 0.78 / 0.94% (4-6 of 638 players) versus 1.10%+ (7+ players), a
+# natural gap at 1.0% between trophies almost nobody had reached and
+# the opening story-mission / early-activity progression. The
+# platinum gets none (it needs every trophy, no new player earns it
+# in one refresh) and a trophy at 100% stays held by everyone. This
+# prior applies ONLY to a history that has never refreshed; a history
+# with a refresh is fitted instead.
 FLAT_N_RATIO = 3868.0 / 638.0
 FLAT_TROPHY_RATIO = 3333.0 / 3230.0
-FLAT_SPREAD = 0.20
+# v1 used 0.20 and its practice 90% coverage was only 0.709 against a
+# nominal 0.90 (truth fell outside the band ~29% of the time, while
+# the top entries cover ~0.98): the band was far too narrow for a
+# refresh the history has never seen. 0.45 widens the logit band to
+# roughly match the observed miss scale; the median is untouched.
+FLAT_SPREAD = 0.45
 
 
 def clamp(x: float) -> float:
@@ -180,13 +191,30 @@ def flat_forecast(case: dict, reads):
 
     Returns [(rate_star, spread)] per trophy, in trophy order.
     See the FLAT_* constants above for where the numbers come from.
+    The extra trophies beyond one per new player go only to the
+    early trophies (rate >= 1.0% in this case's own last read, never
+    the platinum, never a 100% trophy); every other trophy keeps its
+    earner count, so its rate falls as the player count grows.
     """
     last = reads[-1]
     n_last = float(last["players_tracked"])
     n_star = n_last * FLAT_N_RATIO
     new_players = n_star - n_last
-    base = max(float(last["trophies_earned"]) - n_last, 0.0)
     extra_pool = new_players * (FLAT_TROPHY_RATIO - 1.0)
+    # Early trophies, from this case's own data: rate >= 1.0% in the
+    # last read, excluding the platinum (unearnable in one refresh)
+    # and any trophy already at 100%.
+    early = set()
+    for i, trophy in enumerate(case["trophies"]):
+        rate = last["rates"][i]
+        if rate is None or rate < 1.0 or rate >= 99.99:
+            continue
+        if trophy.get("tier") == "platinum":
+            continue
+        early.add(i)
+    early_total = sum(
+        last["rates"][i] / 100.0 * n_last for i in early
+    )
     out = []
     for i, _trophy in enumerate(case["trophies"]):
         rate_last = last["rates"][i]
@@ -195,9 +223,11 @@ def flat_forecast(case: dict, reads):
         earners_last = rate_last / 100.0 * n_last
         if rate_last >= 99.99:
             earners_star = n_star
-        else:
-            share = earners_last / base if base > 0 else 0.0
+        elif i in early and early_total > 0:
+            share = earners_last / early_total
             earners_star = earners_last + extra_pool * share
+        else:
+            earners_star = earners_last
         rate_star = 100.0 * earners_star / n_star
         out.append((rate_star, FLAT_SPREAD))
     return out
