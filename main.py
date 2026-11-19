@@ -1,37 +1,28 @@
 """gta6-trophy-rarity-forecast-01: earners/players two-curve forecaster.
 
-Forecasts every GTA VI PS5 trophy's Exophase earn rate at a case's target from
-the case's history of page reads. Python 3.13, standard library only, no
-network, deterministic (same bytes on every run), fast (milliseconds a case).
+Forecasts every GTA VI PS5 trophy's earn rate on Exophase at the case's
+target as five quantiles (levels 0.05/0.25/0.5/0.75/0.95) on the logit
+scale. Python 3.13 standard library only, deterministic, no network.
 
-Model, in one paragraph: a trophy's displayed rate is earners / players_tracked,
-and both curves move. Exophase refreshes a game's counts on its own schedule,
-hours apart, so the page a read shows is the state as of the last refresh before
-it. The program therefore forecasts TWO curves in log time (hours since the
-19 Nov 00:00 UTC release, via ln(1 + hours), the transform the house curve
-baseline uses): the tracked-player count N(t), fitted on the reads after the
-first refresh, and each trophy's earner count E_i(t), fitted the same way;
-the median rate is E_i/N at the target, less the expected refresh lag. The
-quantile spread combines each fit's residual with a random-walk term that
-widens with the horizon, so the band is honest about how far the target is.
+Model
+-----
+Two curves are fitted in log-time x = ln(1 + hours since release):
 
-The one case the history cannot speak about is a page that has never
-refreshed: every read identical, no refresh seen yet. Then the program falls
-back to the launch-refresh prior the contest's own rules disclose (RULES.txt:
-the page sat unchanged at 638 tracked from 23:48Z and refreshed between
-04:00Z and 04:30Z to 3,868 tracked and 4,276 trophies earned): it expects
-that first refresh before the target, the tracked count multiplying about
-sixfold, each new player bringing about one trophy (the opening activity),
-the rest of the new trophies shared among the trophies players already hold.
-That prior is used ONLY when the history is flat; any refresh visible in
-the history switches the program to the fitted curves above.
+  * N(t): the tracked-player count, fitted as log N ~ a + b*x on hourly
+    bins (median N per bin) over the reads since the first refresh.
+  * E_i(t): each trophy's earner count, fitted as log E_i ~ a_i + b_i*x
+    over the reads since the first refresh where the trophy's earners
+    are at least 1.
 
-How the grader runs it: `python3 -P -s /bot/main.py` in python:3.13-slim.
-It reads every <id>.in in the input directory (one case per run) and writes
-<id>.out to the output directory: {"trophies": [{"id": n, "q": [q05, q25, q50,
-q75, q95]}, ...]}, five quantiles per trophy, 0-100, non-decreasing.
-MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for /input and /output
-outside the grader's container.
+The forecast rate is 100 * E_i(target) / N(target), with the target
+shifted back by half the median Exophase refresh lag (the page shows
+rates as of its last refresh, not as of the read). The spread combines
+both fits' residual std with a random-walk term over the horizon.
+
+When the history has never refreshed (every read identical), the fits
+above are flat and useless, so a launch-refresh prior is used instead
+(see flat_forecast): the first launch-night refresh disclosed in
+RULES.txt, scaled to the case's own player count.
 """
 
 import json
@@ -41,32 +32,34 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# The grader's -P leaves the entry directory off sys.path: put it back
+# first, so a module shipped beside this file imports.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-
-# The game's release: 2026-11-19T00:00:00Z. Log time is measured from here.
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
+# GTA VI release: 2026-11-19T00:00:00Z.
 RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 
-# --- Launch-refresh prior (used ONLY when the case history is flat) --------
-# From RULES.txt: the launch-night page was unchanged at 638 players tracked
-# and 943 trophies earned from 23:48Z, then refreshed between 04:00Z and
-# 04:30Z to 3,868 tracked and 4,276 trophies earned. New players 3,230,
-# new trophies 3,333: about one trophy per new player (the opening activity
-# every new player does first), the rest spread over the trophies already held.
-PRIOR_TRACKED_MULT = 3868.0 / 638.0        # ~6.06x at the first refresh
-PRIOR_TROPHIES_PER_NEW_PLAYER = 3333.0 / 3230.0  # ~1.032
-PRIOR_SPREAD = 0.20  # logit spread while the refresh is only a prior
-
-# Random-walk spread scale (logit per sqrt day), as the house baseline uses.
-RW_SIGMA = 0.5
-MIN_SPREAD = 0.15
-MAX_SPREAD = 1.50
-MAX_REFRESH_LAG_HOURS = 6.0
+# Launch-refresh prior, from RULES.txt: on launch night Exophase's page
+# sat unchanged at 638 players tracked and 943 trophies earned from
+# 23:48Z until the 04:00Z read, then refreshed by the 04:30Z read to
+# 3,868 players tracked and 4,276 trophies earned. So the refresh added
+# 3,868 - 638 = 3,230 new players and 4,276 - 943 = 3,333 new trophies:
+# about one trophy per new player (the opening activity every new
+# player does), with the remaining ~103 trophies spread over the
+# trophies the old players already held, in proportion to how many
+# held each one. A trophy every tracked player already held (100%)
+# stays held by everyone. This prior applies ONLY to a history that
+# has never refreshed; a history with a refresh is fitted instead.
+FLAT_N_RATIO = 3868.0 / 638.0
+FLAT_TROPHY_RATIO = 3333.0 / 3230.0
+FLAT_SPREAD = 0.20
 
 
 def clamp(x: float) -> float:
@@ -75,213 +68,218 @@ def clamp(x: float) -> float:
 
 def logit(pct: float) -> float:
     p = clamp(pct)
-    return math.log(p / (100.0 - p))
+    return math.log(p / (100 - p))
 
 
 def inv_logit(lg: float) -> float:
+    # Numerically stable: 100 / (1 + exp(-lg)) without overflow.
     if lg >= 0:
         return 100.0 / (1.0 + math.exp(-lg))
     e = math.exp(lg)
     return 100.0 * e / (1.0 + e)
 
 
-def round4(x: float):
-    """x rounded to 4 decimals, half up, as JavaScript's Math.round does it.
+def round4(x: float) -> float | int:
+    """x rounded to 4 decimals, half up, as JavaScript's Math.round(x * 10000) / 10000 rounds it.
 
-    A whole number comes back as an int, so json.dumps writes 100 where
-    JavaScript writes 100 (not 100.0).
+    A whole number comes back as an int, so json.dumps writes 100 where JavaScript writes 100 (not 100.0).
     """
-    scaled = x * 10000.0
+    scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 10000.0
-    return int(value) if value == int(value) else value
+    value = whole / 10000
+    return int(value) if value.is_integer() else value
 
 
 def parse_time(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def hours_since_release(when: datetime) -> float:
-    return max(0.0, (when - RELEASE).total_seconds() / 3600.0)
+def hours_since_release(dt: datetime) -> float:
+    return max(0.0, (dt - RELEASE).total_seconds() / 3600.0)
 
 
 def log_time(hours: float) -> float:
-    return math.log1p(hours)
+    return math.log1p(max(0.0, hours))
+
+
+def median(values) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return float(ordered[mid])
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def least_squares(xs, ys):
-    """Return (intercept, slope, residual std) of y ~ a + b*x, or None."""
+    """Ordinary least squares y ~ intercept + slope * x.
+
+    Returns (intercept, slope, residual std) or None when there are
+    fewer than 3 points or x has no variance.
+    """
     n = len(xs)
     if n < 3:
         return None
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    sxx = sum((x - mean_x) ** 2 for x in xs)
     if sxx <= 0:
         return None
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx
-    a = my - b * mx
-    resid = math.sqrt(sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / n)
-    return (a, b, resid)
+    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    sse = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
+    resid = math.sqrt(sse / (n - 2)) if n > 2 else 0.0
+    return (intercept, slope, resid)
 
 
 def first_refresh_index(reads):
-    """Index of the first read where the page differs from the first read.
+    """Index of the first read that differs from the first read, or None.
 
-    A refresh shows as a new players_tracked count (or any rate moving).
-    None when the page never changed: no refresh has been seen yet.
+    A read differs when its players_tracked or its rates differ from
+    the first read's.
     """
-    if not reads:
-        return None
-    n0 = reads[0]["players_tracked"]
-    r0 = reads[0]["rates"]
+    first = reads[0]
     for i, read in enumerate(reads):
-        if read["players_tracked"] != n0:
-            return i
-        if read["rates"] != r0:
+        if (read["players_tracked"] != first["players_tracked"]
+                or read["rates"] != first["rates"]):
             return i
     return None
 
 
-def refresh_lag_hours(reads, first_idx):
-    """Half the median gap between successive distinct tracked counts.
+def refresh_lag_hours(reads, first_idx: int) -> float:
+    """Half the median gap between Exophase refreshes, in hours.
 
-    The displayed value at the target is the state as of the last refresh
-    before it, so the fits are read that far before the target. Zero when
-    fewer than two distinct counts were seen.
+    Collects (N, at) each time the tracked-player count changes from
+    the first refreshed read on; with fewer than 3 distinct counts
+    there is no lag to estimate, so 0.0. Otherwise the median gap
+    between changes, halved (the page lags its refresh by half a
+    refresh interval on average), bounded to [0, 6].
     """
-    seen = []
+    changes = []
+    prev = None
     for read in reads[first_idx:]:
         n = read["players_tracked"]
-        if not seen or seen[-1][0] != n:
-            seen.append((n, parse_time(read["at"])))
-    if len(seen) < 3:
+        if n != prev:
+            changes.append((n, parse_time(read["at"])))
+            prev = n
+    if len({n for n, _ in changes}) < 3:
         return 0.0
-    gaps = [(seen[i + 1][1] - seen[i][1]).total_seconds() / 3600.0
-            for i in range(len(seen) - 1)]
-    gaps.sort()
-    med = gaps[len(gaps) // 2]
-    return min(MAX_REFRESH_LAG_HOURS, max(0.0, med / 2.0))
+    gaps = [
+        (changes[k + 1][1] - changes[k][1]).total_seconds() / 3600.0
+        for k in range(len(changes) - 1)
+    ]
+    lag = median(gaps) / 2.0
+    return min(6.0, max(0.0, lag))
 
 
-def forecast_flat_history(case, last, horizon_days):
-    """Prior-path forecast: the page never refreshed in the history.
+def flat_forecast(case: dict, reads):
+    """Launch-refresh prior for a history that has never refreshed.
 
-    Expects the first refresh before the target (RULES.txt prior): tracked
-    multiplies ~6x, each new player brings ~1 trophy, the opening activity
-    first. A trophy every tracked player already holds stays held.
+    Returns [(rate_star, spread)] per trophy, in trophy order.
+    See the FLAT_* constants above for where the numbers come from.
     """
+    last = reads[-1]
     n_last = float(last["players_tracked"])
-    n_star = n_last * PRIOR_TRACKED_MULT
+    n_star = n_last * FLAT_N_RATIO
     new_players = n_star - n_last
-    total_earned = float(last["trophies_earned"])
-    rows = []
-    for i, trophy in enumerate(case["trophies"]):
+    base = max(float(last["trophies_earned"]) - n_last, 0.0)
+    extra_pool = new_players * (FLAT_TROPHY_RATIO - 1.0)
+    out = []
+    for i, _trophy in enumerate(case["trophies"]):
         rate_last = last["rates"][i]
         if rate_last is None:
             rate_last = 0.0
         earners_last = rate_last / 100.0 * n_last
         if rate_last >= 99.99:
-            # Held by every tracked player: the new ones hold it too.
             earners_star = n_star
         else:
-            others = max(total_earned - earners_last, 0.0)
-            # The new trophies beyond one per new player, shared pro rata
-            # to what each trophy already holds.
-            extra_pool = max(new_players * (PRIOR_TROPHIES_PER_NEW_PLAYER - 1.0), 0.0)
-            base = max(total_earned - n_last, 0.0)  # trophies beyond the opener
             share = earners_last / base if base > 0 else 0.0
             earners_star = earners_last + extra_pool * share
-        rate_star = 100.0 * earners_star / n_star if n_star > 0 else rate_last
-        rows.append((trophy["id"], rate_star, PRIOR_SPREAD))
-    return rows
+        rate_star = 100.0 * earners_star / n_star
+        out.append((rate_star, FLAT_SPREAD))
+    return out
 
 
-def forecast_fitted(case, reads, first_idx, horizon_days):
-    """Two-curve forecast from a history that contains at least one refresh."""
+def fitted_forecast(case: dict, reads, first_idx: int):
+    """Log-time fits of N(t) and of each trophy's earner count.
+
+    Returns [(rate_star, spread)] per trophy, in trophy order.
+    """
     lag = refresh_lag_hours(reads, first_idx)
     target = parse_time(case["target"])
     x_target = log_time(hours_since_release(target) - lag)
+    horizon_days = case["horizon_minutes"] / 1440.0
 
-    # --- Tracked players N(t): log N ~ a + b * ln(1 + hours since release).
-    # One point per hour bin (median N in the bin) so the 10-minute cadence
-    # does not overweight the flat stretches between refreshes.
+    # (a) Fit N(t): median N per whole-hour bin since the refresh,
+    # log N ~ a + b * x.
     bins = {}
     for read in reads[first_idx:]:
-        h = int(hours_since_release(parse_time(read["at"])))
-        bins.setdefault(h, []).append(float(read["players_tracked"]))
-    xs, ys = [], []
-    for h in sorted(bins):
-        vals = sorted(bins[h])
-        n_med = vals[len(vals) // 2]
-        if n_med > 0:
-            xs.append(log_time(float(h)))
-            ys.append(math.log(n_med))
+        hour = int(hours_since_release(parse_time(read["at"])))
+        bins.setdefault(hour, []).append(read["players_tracked"])
+    xs = [log_time(hour) for hour in sorted(bins)]
+    ys = [math.log(median(bins[hour])) for hour in sorted(bins)]
     fit_n = least_squares(xs, ys)
     if fit_n is None:
         n_star = float(reads[-1]["players_tracked"])
         resid_n = 0.5
     else:
         a_n, b_n, resid_n = fit_n
-        n_star = math.exp(a_n + b_n * x_target)
-    n_star = max(n_star, 1.0)
+        n_star = max(1.0, math.exp(a_n + b_n * x_target))
 
-    # --- Earners E_i(t) per trophy: log E_i ~ a_i + b_i * ln(1 + hours).
-    rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        xs_i, ys_i = [], []
+    # (b) Fit each trophy's earner count the same way.
+    out = []
+    for i, _trophy in enumerate(case["trophies"]):
+        xs_i = []
+        ys_i = []
         for read in reads[first_idx:]:
             rate = read["rates"][i]
             if rate is None:
                 continue
-            earners = rate / 100.0 * float(read["players_tracked"])
+            earners = rate / 100.0 * read["players_tracked"]
             if earners < 1.0:
                 continue
             xs_i.append(log_time(hours_since_release(parse_time(read["at"]))))
             ys_i.append(math.log(earners))
-        fit_i = least_squares(xs_i, ys_i)
-        rate_last = reads[-1]["rates"][i]
-        if rate_last is None:
-            rate_last = 0.0
-        if fit_i is None:
-            # Too little movement to fit: hold the last rate, wide band.
-            rows.append((trophy["id"], rate_last, 1.0))
-            continue
-        a_i, b_i, resid_i = fit_i
-        earners_star = math.exp(a_i + b_i * x_target)
-        earners_star = min(max(earners_star, 0.0), n_star)
-        rate_star = 100.0 * earners_star / n_star
-        spread = math.sqrt(resid_i ** 2 + resid_n ** 2
-                           + (RW_SIGMA * math.sqrt(horizon_days)) ** 2)
-        spread = min(MAX_SPREAD, max(MIN_SPREAD, spread))
-        rows.append((trophy["id"], rate_star, spread))
-    return rows
+        fit = least_squares(xs_i, ys_i)
+        if fit is None:
+            last_rate = reads[-1]["rates"][i]
+            rate_star = last_rate if last_rate is not None else 0.0
+            spread = 1.0
+        else:
+            a_i, b_i, resid_i = fit
+            earners_star = min(max(math.exp(a_i + b_i * x_target), 0.0), n_star)
+            rate_star = 100.0 * earners_star / n_star
+            spread = math.sqrt(
+                resid_i ** 2 + resid_n ** 2
+                + (0.5 * math.sqrt(horizon_days)) ** 2
+            )
+            spread = min(1.50, max(0.15, spread))
+        out.append((rate_star, spread))
+    return out
 
 
 def forecast_case(case: dict, name: str) -> dict:
     if case["levels"] != LEVELS:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    if not case["history"]:
+    reads = case["history"]
+    if not reads:
         raise ValueError(f"{name} has no history")
-    last = case["history"][-1]
-    horizon_days = case["horizon_minutes"] / 1440.0
-    first_idx = first_refresh_index(case["history"])
+    first_idx = first_refresh_index(reads)
     if first_idx is None:
-        medians = forecast_flat_history(case, last, horizon_days)
+        rates = flat_forecast(case, reads)
     else:
-        medians = forecast_fitted(case, case["history"], first_idx, horizon_days)
+        rates = fitted_forecast(case, reads, first_idx)
     rows = []
-    for tid, rate_star, spread in medians:
+    for trophy, (rate_star, spread) in zip(case["trophies"], rates):
         lg = logit(rate_star)
         qs = [round4(clamp(inv_logit(lg + z * spread))) for z in Z]
-        # Non-decreasing, after rounding.
-        for k in range(1, 5):
+        for k in range(1, len(qs)):
             if qs[k] < qs[k - 1]:
                 qs[k] = qs[k - 1]
-        rows.append({"id": tid, "q": qs})
+        rows.append({"id": trophy["id"], "q": qs})
     return {"trophies": rows}
 
 
@@ -292,7 +290,8 @@ def main() -> None:
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case, path.name)
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":
